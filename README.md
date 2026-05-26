@@ -36,32 +36,70 @@ A personal ambient-recording pipeline. Plug in a Sony IC Recorder at the end of 
 
 ## Install
 
-### Host (Linux — anywhere whisper.cpp builds: Jetson, Ryzen mini-PC, full server)
+### Prerequisites — knock these out first
+
+**Both sides:**
+- Git (to clone this repo)
+- An SSH keypair, with the client's public key in the host's `~/.ssh/authorized_keys`
+
+**Host side (Linux — needs build tools to compile whisper.cpp):**
 
 ```bash
-# Prerequisite: whisper.cpp + small model
+# Build toolchain + runtime deps in one shot (Debian/Ubuntu)
+sudo apt update
+sudo apt install -y build-essential cmake \
+    ffmpeg coreutils rsync openssh-client util-linux curl ripgrep python3
+
+# (Optional, for daily summaries) Node ≥ 20 via nvm, for the Claude CLI
+curl -fsSL -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.nvm/nvm.sh && nvm install 22
+```
+
+- **Python ≥ 3.10** required (`daily-summary.py` uses `str | None` union syntax). Ubuntu 22.04 ships 3.10, Debian 12 ships 3.11 — fine. Older distros: install Python 3.10+ explicitly.
+- **Disk budget:** ~10 MB per hour of recording for transcripts. Audio is shredded post-transcription, so the archive grows slowly.
+- **Hardware:** the pipeline works on anything that compiles whisper.cpp — Jetson Orin Nano, Ryzen mini-PC, full server. The hard floor is whatever the Whisper model you choose can run at acceptable speed (see below).
+
+**Client side (macOS):**
+- Xcode command-line tools if you don't already have them: `xcode-select --install`
+- That's it — `bbsync` and `bb` are pure shell, no other deps. (Optional `fuse-t` + `sshfs` install is documented in `install-client.sh` for Finder-mounted archive browsing.)
+
+### Whisper model sizing
+
+| Model | GGML size | Speed on modern x86 CPU | Speed on Apple Silicon / Orin Nano | Quality |
+|---|---|---|---|---|
+| `tiny` | ~75 MB | very fast | very fast | low |
+| `base` | ~142 MB | fast | fast | usable |
+| `small` (default) | ~466 MB | ~2x realtime | ~5–10x realtime | CPU sweet spot |
+| `medium` | ~1.5 GB | ~2x slower than small | OK | better proper-noun + accent handling |
+| `large-v3` | ~3.1 GB | needs GPU or Apple Silicon | OK on M-series | best |
+
+Switch via `BLACKBOX_WHISPER_MODEL=medium` after running the model's downloader (`bash models/download-ggml-model.sh medium` inside the whisper.cpp dir).
+
+### Host install
+
+```bash
+# Build whisper.cpp + grab the small model
 git clone https://github.com/ggerganov/whisper.cpp ~/whisper.cpp
 cd ~/whisper.cpp && make
 bash models/download-ggml-model.sh small
 
-# Prerequisite (optional, for daily summaries): Claude Code Max subscription
-# Install Node via nvm, then:
+# (Optional, for daily summaries) Claude Code Max subscription via the local CLI
 npm install -g @anthropic-ai/claude-code
 mkdir -p ~/.local/bin
 ln -sf ~/.nvm/versions/node/$(nvm current)/bin/claude ~/.local/bin/claude
 claude /login   # interactive — pairs with your Max sub
 
 # Then install blackbox-voice:
-git clone https://github.com/<your-github>/blackbox-voice ~/blackbox-voice
+git clone https://github.com/DTSthom/blackbox-voice ~/blackbox-voice
 cd ~/blackbox-voice && ./install-host.sh
 ```
 
-`install-host.sh` checks for `ffprobe / shred / rsync / python3 / ssh / flock / curl / rg`, creates `/data/blackbox` and `~/blackbox-incoming` with `700` perms, installs the four systemd units (substituting `@USER@` / `@HOME@` / `@SCRIPT_DIR@` placeholders for your install path), and enables both timers.
+`install-host.sh` re-checks the dependency list, creates `/data/blackbox` and `~/blackbox-incoming` with `700` perms, installs the four systemd units (substituting `@USER@` / `@HOME@` / `@SCRIPT_DIR@` placeholders for your install path), and enables both timers.
 
-### Client (Mac)
+### Client install (Mac)
 
 ```bash
-git clone https://github.com/<your-github>/blackbox-voice ~/blackbox-voice
+git clone https://github.com/DTSthom/blackbox-voice ~/blackbox-voice
 cd ~/blackbox-voice
 export BLACKBOX_HOST=your-host-alias   # SSH alias from ~/.ssh/config, or user@host
 ./install-client.sh
