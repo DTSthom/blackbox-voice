@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll blackbox-incoming and process pending audio
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=bounce-blackbox.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Generate daily blackbox transcript summary (01:00 local — summarizes yesterday)
+
+[Timer]
+# Fires at 01:00 local time, summarizing the day that just ended.
+# Late-night recordings (post-23:00) get a ~1hr cushion to ingest + transcribe
+# before the summary fires. Service passes "yesterday" as the date arg so
+# datetime.now() picking up the NEW day doesn't generate an empty summary.
+OnCalendar=*-*-* 01:00:00 America/New_York
+Persistent=true
+Unit=daily-summary.service
+
+[Install]
+WantedBy=timers.target

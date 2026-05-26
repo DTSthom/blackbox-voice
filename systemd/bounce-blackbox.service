@@ -1,0 +1,17 @@
+[Unit]
+Description=Process pending blackbox audio files
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@
+ExecStart=@SCRIPT_DIR@/bounce_blackbox.sh
+# Fire ntfy on failure if BLACKBOX_NTFY_TOPIC is set (no-op otherwise).
+# bounce exits 6 if every attempted file failed; other non-zero = sanity-check fail.
+ExecStopPost=@SCRIPT_DIR@/alert-on-fail.sh bounce-blackbox.service
+# Lockfile inside the script prevents overlap. Set generous timeout so long
+# transcribe runs (e.g., a full field day of audio) aren't SIGTERM'd mid-Whisper.
+TimeoutStartSec=infinity
+Nice=10

@@ -1,0 +1,20 @@
+[Unit]
+Description=Generate daily blackbox transcript summary via Claude CLI (Max sub)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@
+Environment="CLAUDE_BIN=@HOME@/.local/bin/claude"
+Environment="HOME=@HOME@"
+# 01:00 timer fires AFTER midnight, so datetime.now() reports the NEW day.
+# Compute "yesterday" in local TZ and pass it explicitly, so the summary
+# correctly targets the day that just ended.
+ExecStart=/bin/bash -c '/usr/bin/python3 @SCRIPT_DIR@/daily-summary.py $(TZ=America/New_York date -d "yesterday" +%%Y-%%m-%%d)'
+# Fire ntfy on failure if BLACKBOX_NTFY_TOPIC is set (no-op otherwise).
+ExecStopPost=@SCRIPT_DIR@/alert-on-fail.sh daily-summary.service
+TimeoutStartSec=10min
+Nice=10

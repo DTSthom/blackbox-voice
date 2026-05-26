@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# bbsync — dump UX570 (or any Sony IC RECORDER) → host blackbox pipeline.
+# Detects mounted recorder, prompts for tags, rsyncs to host:~/blackbox-incoming/.
+#
+# Usage:
+#   bbsync                       Interactive: auto-detect mount, prompt for tags
+#   bbsync --source PATH         Override source directory
+#   bbsync --no-prompt           Skip tag prompt (no tags applied)
+#   bbsync --dry-run             Show what would happen, don't transfer
+#
+# Configure: set BLACKBOX_HOST in your shell env (or ~/.ssh/config Host alias)
+# to the SSH target running bounce_blackbox.sh. Default: "blackbox-host".
+
+set -euo pipefail
+
+HOST="${BLACKBOX_HOST:-blackbox-host}"
+# Use relative path so rsync resolves to the remote user's $HOME automatically.
+# (Literal "$HOME" in rsync destinations is NOT expanded server-side.)
+HOST_INCOMING_REL="blackbox-incoming"
+
+# Sony UX570 stores REC-button files in REC_FILE/FOLDER01..05 (default REC button mode)
+# and Scene/preset recordings under VOICE/FOLDER01..05. Probe deepest paths first.
+DEFAULT_SOURCES=(
+    "/Volumes/IC RECORDER/REC_FILE/FOLDER0"{1..5}
+    "/Volumes/IC RECORDER/REC_FILE"
+    "/Volumes/IC RECORDER/VOICE/FOLDER0"{1..5}
+    "/Volumes/IC RECORDER/VOICE"
+    "/Volumes/IC RECORDER"
+)
+
+SOURCE=""
+PROMPT=1
+DRYRUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source) SOURCE="$2"; shift 2 ;;
+        --no-prompt) PROMPT=0; shift ;;
+        --dry-run) DRYRUN=1; shift ;;
+        -h|--help)
+            sed -n '2,11p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Auto-detect recorder if no source given
+if [[ -z "$SOURCE" ]]; then
+    for candidate in "${DEFAULT_SOURCES[@]}"; do
+        if [[ -d "$candidate" ]] && find "$candidate" -maxdepth 1 -type f -iname '*.mp3' -print -quit | grep -q .; then
+            SOURCE="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$SOURCE" || ! -d "$SOURCE" ]]; then
+    echo "Error: recorder not detected." >&2
+    echo "  Plug in the recorder and ensure '/Volumes/IC RECORDER' is mounted." >&2
+    echo "  Manual override: bbsync --source /path/to/recordings" >&2
+    exit 1
+fi
+
+# Count audio files
+file_count=$(find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) | wc -l | tr -d ' ')
+echo "Source: $SOURCE"
+echo "Found $file_count audio file(s)"
+
+if [[ "$file_count" -eq 0 ]]; then
+    echo "Nothing to do."
+    exit 0
+fi
+
+# Tag prompt
+TAGS=""
+if [[ "$PROMPT" -eq 1 ]]; then
+    echo ""
+    echo "Today's context tags (comma-separated, e.g. 'project:foo, person:alice, activity:standup'):"
+    echo "Leave empty to skip tagging."
+    read -r TAGS || TAGS=""
+fi
+
+# Build session ID
+SESSION="session-$(date -u +%Y%m%dT%H%M%SZ)"
+SESSION_REL="$HOST_INCOMING_REL/$SESSION"  # relative to remote $HOME
+
+if [[ "$DRYRUN" -eq 1 ]]; then
+    echo ""
+    echo "[DRY RUN]"
+    echo "  Session: $SESSION"
+    echo "  Files:"
+    find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -exec basename {} \; | sed 's/^/    /'
+    [[ -n "$TAGS" ]] && echo "  Tags: $TAGS"
+    echo "  Destination: $HOST:~/$SESSION_REL/"
+    echo "[DRY RUN end — no files transferred]"
+    exit 0
+fi
+
+# Atomic session-dir creation + .uploading flag. Combined into ONE ssh call so
+# the bounce processor can never observe a session_dir without the flag (closes
+# the residual race between separate mkdir and touch invocations — without it,
+# bounce could process an empty dir, prematurely fire cleanup_session, and strip
+# tags.txt). Flag is cleared AFTER rsync completes successfully. If bbsync
+# crashes mid-upload, the flag is left behind and visible via `bb status`.
+echo ""
+echo "Creating $SESSION on $HOST..."
+ssh "$HOST" "mkdir -p \"\$HOME/$SESSION_REL\" && chmod 700 \"\$HOME/$SESSION_REL\" && touch \"\$HOME/$SESSION_REL/.uploading\""
+
+# Upload tags sidecar atomically (write to .tmp + rename — guards against partial
+# writes if the ssh stream dies mid-cat). Same-FS rename is atomic on ext4/btrfs.
+if [[ -n "$TAGS" ]]; then
+    ssh "$HOST" "cat > \"\$HOME/$SESSION_REL/tags.txt.tmp\" && mv \"\$HOME/$SESSION_REL/tags.txt.tmp\" \"\$HOME/$SESSION_REL/tags.txt\"" <<EOF
+date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+operator: $USER
+host: $(hostname -s)
+source_mount: $SOURCE
+tags: $TAGS
+EOF
+    echo "Tags written."
+fi
+
+# Rsync audio files — RELATIVE path so rsync expands to remote user's $HOME
+echo "Uploading $file_count file(s)..."
+rsync -av --progress \
+    --include='*.mp3' --include='*.wav' --include='*.MP3' --include='*.WAV' --exclude='*' \
+    "$SOURCE"/ "$HOST:$SESSION_REL/" || {
+    echo "Rsync failed. Files remain on the recorder." >&2
+    echo ".uploading flag retained on $HOST for visibility — clear manually via:" >&2
+    echo "  ssh $HOST \"rm -f \\\$HOME/$SESSION_REL/.uploading\"" >&2
+    exit 1
+}
+
+# Clear atomicity flag — bounce can now process this session
+ssh "$HOST" "rm -f \"\$HOME/$SESSION_REL/.uploading\""
+
+echo ""
+echo "Uploaded $file_count file(s) to $SESSION"
+echo ""
+
+# Offer to clean recorder. Tolerate non-tty / EOF stdin (piped invocations):
+# set -e would otherwise kill the script on read returning nonzero, leaving the
+# recorder un-wiped AND the script exit code falsely flagging upload failure.
+read -p "Delete files from recorder? [y/N] " del || del=""
+if [[ "$del" =~ ^[Yy]$ ]]; then
+    find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -delete
+    echo "Recorder cleaned."
+else
+    echo "Recorder files retained. Delete manually via the device or Finder when ready."
+fi
+
+echo ""
+echo "Pipeline will pick up within ~60s. Monitor: bb log"

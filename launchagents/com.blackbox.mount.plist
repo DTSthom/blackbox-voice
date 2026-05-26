@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.blackbox.mount</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>mkdir -p $HOME/blackbox-archive; if mount | grep -q "on $HOME/blackbox-archive "; then echo "already mounted"; exit 0; fi; exec /usr/local/bin/sshfs @HOST@:/data/blackbox $HOME/blackbox-archive -o reconnect,defer_permissions,volname=Blackbox</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>StandardErrorPath</key><string>/tmp/blackbox-mount.err</string>
+    <key>StandardOutPath</key><string>/tmp/blackbox-mount.out</string>
+</dict>
+</plist>
