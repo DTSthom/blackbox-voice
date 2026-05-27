@@ -75,6 +75,25 @@ source ~/.nvm/nvm.sh && nvm install 22
 
 Switch via `BLACKBOX_WHISPER_MODEL=medium` after running the model's downloader (`bash models/download-ggml-model.sh medium` inside the whisper.cpp dir).
 
+### Silero VAD model (recommended)
+
+bounce enables whisper.cpp's `--vad` flag whenever a Silero VAD model file is present at `~/whisper.cpp/models/ggml-silero-v5.1.2.bin` (or `/usr/local/share/whisper-models/...`). VAD culls non-speech regions before transcription, which:
+
+- prevents Whisper from filling silence with hallucinated placeholders (`[Sounds of a tree]`, `[Music]`, `[BLANK_AUDIO]`),
+- avoids burning transcription time on minutes of ambient noise,
+- materially improves speech recovery on long sparse recordings (pocket-mode field days, etc).
+
+Download once:
+
+```bash
+curl -L -o ~/whisper.cpp/models/ggml-silero-v5.1.2.bin \
+  https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+```
+
+The VAD model is ~880 KB. bounce will pick it up automatically on the next run. To turn VAD off without removing the file, set `BLACKBOX_VAD=0` in the bounce environment.
+
+**Long-recording note:** whisper.cpp's `--vad` mode has a known issue where speech content past the ~2h mark of a single invocation can be silently dropped. bounce works around this by splitting any audio longer than `BLACKBOX_CHUNK_SECONDS` (default 1800s / 30min) into chunks via ffmpeg, transcribing each independently, then merging the per-chunk transcripts with offset-adjusted timestamps. If you ever want the non-chunked behavior back, set `BLACKBOX_CHUNK_SECONDS=0`.
+
 ### Host install
 
 ```bash
@@ -137,6 +156,9 @@ Host blackbox-host
 | `BLACKBOX_INCOMING` | `~/blackbox-incoming` | bb status | Pending-uploads dir on the host |
 | `BLACKBOX_WHISPER_MODEL` | `small` | bounce | Whisper model size (`tiny`, `base`, `small`, `medium`, `large`) |
 | `BLACKBOX_WHISPER_LANG` | `en` | bounce | Whisper language code |
+| `BLACKBOX_VAD` | `1` (on if model present) | bounce | Voice-Activity-Detection on/off; `0` disables `--vad` even when the Silero model file is present |
+| `BLACKBOX_CHUNK_SECONDS` | `1800` (30 min) | bounce | Split audio longer than this into chunks before transcribing (workaround for a whisper.cpp `--vad` long-file content-drop bug; set to `0` to disable chunking) |
+| `BLACKBOX_KEEP_AUDIO` | `0` (audio shredded) | bounce | When `1`, audio is retained at `$BLACKBOX_BASE/YYYY/MM/DD/audio/` after transcribe; useful for iterating on Whisper quality |
 | `BLACKBOX_RECORDER_TZ` | `America/New_York` | bounce | TZ the Sony recorder's clock is set to |
 | `BLACKBOX_WEDGE_SEC` | `14400` (4h) | bounce | Wedge-alert threshold for stuck whisper-cli |
 | `BLACKBOX_NTFY_TOPIC` | unset (alerts off) | bounce, alert-on-fail | ntfy.sh topic for push alerts on failure or wedge |

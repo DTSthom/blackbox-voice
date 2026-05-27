@@ -5,7 +5,7 @@
 # For each session-* dir in ~/blackbox-incoming/:
 #   - process each MP3/WAV
 #   - run Whisper → transcript.md with frontmatter (timestamps, tags, duration)
-#   - shred audio on success
+#   - shred audio on success (unless BLACKBOX_KEEP_AUDIO=1 — retains for re-transcribe)
 #   - clean up empty session dir
 
 set -euo pipefail
@@ -15,6 +15,11 @@ INCOMING="$HOME/blackbox-incoming"
 ARCHIVE_BASE="${BLACKBOX_BASE:-/data/blackbox}"
 WHISPER_MODEL_NAME="${BLACKBOX_WHISPER_MODEL:-small}"
 WHISPER_LANGUAGE="${BLACKBOX_WHISPER_LANG:-en}"
+# When 1, retain audio under $ARCHIVE_BASE/YYYY/MM/DD/audio/ after transcribe
+# instead of shredding it. Useful during Whisper-quality iteration when the
+# operator wants to rerun against the same audio with different model/params.
+# Default 0 preserves the original "no audio persistence" posture.
+KEEP_AUDIO="${BLACKBOX_KEEP_AUDIO:-0}"
 
 # Whisper binary + model — auto-detect, override via env if needed
 WHISPER_BIN="${WHISPER_BIN:-}"
@@ -35,6 +40,35 @@ if [[ -z "$WHISPER_MODEL_PATH" ]]; then
         if [[ -f "$candidate" ]]; then WHISPER_MODEL_PATH="$candidate"; break; fi
     done
 fi
+
+# Silero VAD model — when present, whisper-cli is invoked with --vad so
+# non-speech regions are skipped entirely. Prevents Whisper from hallucinating
+# placeholder labels (e.g. "[Sounds of a tree]", "[BLANK_AUDIO]") across long
+# recordings with sparse speech, and avoids burning transcription time on
+# silence. Download with:
+#   curl -L -o ~/whisper.cpp/models/ggml-silero-v5.1.2.bin \
+#     https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+# To disable VAD without removing the model file, set BLACKBOX_VAD=0.
+VAD_MODEL_PATH="${VAD_MODEL_PATH:-}"
+VAD_ENABLED="${BLACKBOX_VAD:-1}"
+if [[ -z "$VAD_MODEL_PATH" ]]; then
+    for candidate in \
+        "$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin" \
+        "/usr/local/share/whisper-models/ggml-silero-v5.1.2.bin"; do
+        if [[ -f "$candidate" ]]; then VAD_MODEL_PATH="$candidate"; break; fi
+    done
+fi
+
+# Audio chunking threshold. whisper.cpp's --vad mode silently drops content
+# past the ~2h mark on a single invocation (verified empirically: an 8h
+# recording lost the last 6h of speech entirely; re-running VAD on
+# 30-minute chunks recovered every speech region cleanly). Workaround:
+# split anything longer than CHUNK_SECONDS into CHUNK_SECONDS-sized pieces
+# via ffmpeg, run whisper on each chunk, then merge with offset-adjusted
+# timestamps. 1800s = 30 min, well below the failure threshold. Set to 0
+# to disable chunking and run whisper on the full file (not recommended
+# for any recording longer than ~90 min if VAD is enabled).
+CHUNK_SECONDS="${BLACKBOX_CHUNK_SECONDS:-1800}"
 
 LOG_FILE="$ARCHIVE_BASE/_log"
 LOCKFILE="/tmp/bounce-blackbox.lock"
@@ -184,17 +218,92 @@ process_audio() {
     # Stderr (progress/diagnostics) goes to log.
     local whisper_txt="$dest_dir/.whisper-$basename_noext.txt"
 
-    log "WHISPER: starting $filename (model=$WHISPER_MODEL_NAME lang=$WHISPER_LANGUAGE)"
+    local vad_flags=()
+    local vad_status="off"
+    if [[ "$VAD_ENABLED" == "1" && -n "$VAD_MODEL_PATH" && -f "$VAD_MODEL_PATH" ]]; then
+        vad_flags=(--vad --vad-model "$VAD_MODEL_PATH")
+        vad_status="on ($(basename "$VAD_MODEL_PATH"))"
+    fi
 
-    if ! "$WHISPER_BIN" \
-            -m "$WHISPER_MODEL_PATH" \
-            -f "$dest_audio" \
-            -l "$WHISPER_LANGUAGE" \
-            -np \
-            > "$whisper_txt" 2>> "$LOG_FILE"; then
-        log "ERROR: whisper failed on $filename — audio retained at $dest_audio"
-        rm -f "$whisper_txt"
+    # Determine audio duration; we chunk anything longer than CHUNK_SECONDS so
+    # whisper.cpp's --vad mode doesn't silently drop later content.
+    local audio_seconds
+    audio_seconds=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$dest_audio" 2>>"$LOG_FILE" | awk '{print int($1)}')
+    if [[ -z "$audio_seconds" || ! "$audio_seconds" =~ ^[0-9]+$ ]]; then
+        log "ERROR: ffprobe failed to read duration of $dest_audio"
         return 1
+    fi
+
+    if [[ "$CHUNK_SECONDS" -gt 0 && "$audio_seconds" -gt "$CHUNK_SECONDS" ]]; then
+        log "WHISPER: starting $filename — chunked (${audio_seconds}s audio, ${CHUNK_SECONDS}s chunks, model=$WHISPER_MODEL_NAME lang=$WHISPER_LANGUAGE vad=$vad_status)"
+
+        local chunks_dir="$dest_dir/.chunks-$basename_noext"
+        rm -rf "$chunks_dir"
+        mkdir -p "$chunks_dir"
+
+        if ! ffmpeg -y -i "$dest_audio" -f segment -segment_time "$CHUNK_SECONDS" -c copy "$chunks_dir/chunk_%03d.mp3" 2>> "$LOG_FILE"; then
+            log "ERROR: ffmpeg chunking failed on $filename — audio retained at $dest_audio"
+            rm -rf "$chunks_dir"
+            return 1
+        fi
+
+        : > "$whisper_txt"
+        local chunk_idx=0
+        local chunk
+        for chunk in "$chunks_dir"/chunk_*.mp3; do
+            local chunk_offset=$((chunk_idx * CHUNK_SECONDS))
+            local chunk_raw="$chunks_dir/raw_$(printf '%03d' "$chunk_idx").txt"
+
+            if ! "$WHISPER_BIN" \
+                    -m "$WHISPER_MODEL_PATH" \
+                    -f "$chunk" \
+                    -l "$WHISPER_LANGUAGE" \
+                    -np \
+                    "${vad_flags[@]}" \
+                    > "$chunk_raw" 2>> "$LOG_FILE"; then
+                log "ERROR: whisper failed on chunk $chunk_idx of $filename — audio retained at $dest_audio"
+                rm -rf "$chunks_dir"
+                rm -f "$whisper_txt"
+                return 1
+            fi
+
+            # Shift timestamps by chunk_offset seconds and append.
+            python3 -c '
+import re, sys
+offset = float(sys.argv[1])
+pattern = re.compile(r"^\[(\d+):(\d+):(\d+\.\d+) --> (\d+):(\d+):(\d+\.\d+)\](.*)$")
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    m = pattern.match(line)
+    if not m:
+        print(line)
+        continue
+    start = int(m.group(1))*3600 + int(m.group(2))*60 + float(m.group(3)) + offset
+    end   = int(m.group(4))*3600 + int(m.group(5))*60 + float(m.group(6)) + offset
+    sh, sm, ss = int(start // 3600), int((start % 3600) // 60), start % 60
+    eh, em, es = int(end   // 3600), int((end   % 3600) // 60), end   % 60
+    print(f"[{sh:02d}:{sm:02d}:{ss:06.3f} --> {eh:02d}:{em:02d}:{es:06.3f}]{m.group(7)}")
+' "$chunk_offset" < "$chunk_raw" >> "$whisper_txt"
+
+            chunk_idx=$((chunk_idx + 1))
+        done
+
+        rm -rf "$chunks_dir"
+        log "WHISPER: completed $filename ($chunk_idx chunks, $(wc -l < "$whisper_txt") output lines)"
+    else
+        log "WHISPER: starting $filename (model=$WHISPER_MODEL_NAME lang=$WHISPER_LANGUAGE vad=$vad_status duration=${audio_seconds}s)"
+
+        if ! "$WHISPER_BIN" \
+                -m "$WHISPER_MODEL_PATH" \
+                -f "$dest_audio" \
+                -l "$WHISPER_LANGUAGE" \
+                -np \
+                "${vad_flags[@]}" \
+                > "$whisper_txt" 2>> "$LOG_FILE"; then
+            log "ERROR: whisper failed on $filename — audio retained at $dest_audio"
+            rm -f "$whisper_txt"
+            return 1
+        fi
     fi
 
     if [[ ! -s "$whisper_txt" ]]; then
@@ -262,7 +371,11 @@ process_audio() {
     rm -f "$whisper_txt"
 
     # --- Shred audio (decided posture: no audio persistence) ---
-    if shred -u "$dest_audio" 2>/dev/null; then
+    # Unless BLACKBOX_KEEP_AUDIO=1, in which case audio is retained at $dest_audio
+    # so the operator can re-run Whisper against it with different model/params.
+    if [[ "$KEEP_AUDIO" == "1" ]]; then
+        log "DONE: $filename → $transcript_md (audio retained at $dest_audio per BLACKBOX_KEEP_AUDIO=1)"
+    elif shred -u "$dest_audio" 2>/dev/null; then
         log "DONE: $filename → $transcript_md (audio shredded)"
     else
         # shred may not be available on all systems; fall back to rm
