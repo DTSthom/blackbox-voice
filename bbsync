@@ -48,7 +48,7 @@ done
 # Auto-detect recorder if no source given
 if [[ -z "$SOURCE" ]]; then
     for candidate in "${DEFAULT_SOURCES[@]}"; do
-        if [[ -d "$candidate" ]] && find "$candidate" -maxdepth 1 -type f -iname '*.mp3' -print -quit | grep -q .; then
+        if [[ -d "$candidate" ]] && find "$candidate" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -print -quit | grep -q .; then
             SOURCE="$candidate"
             break
         fi
