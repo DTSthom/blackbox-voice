@@ -18,6 +18,13 @@ HOST="${BLACKBOX_HOST:-blackbox-host}"
 # (Literal "$HOME" in rsync destinations is NOT expanded server-side.)
 HOST_INCOMING_REL="blackbox-incoming"
 
+# Local staging dir. USB reads from IC recorders are unreliable on sustained
+# transfers (device power-cycles or drops off the bus mid-rsync). Two-stage
+# upload — recorder → local SSD → host — decouples the flaky USB read from
+# the network transfer so a dropped USB connection doesn't kill a half-done
+# upload. Partial files are retained across runs; rerun bbsync to resume.
+STAGE_BASE="$HOME/.bbsync-stage"
+
 # Sony UX570 stores REC-button files in REC_FILE/FOLDER01..05 (default REC button mode)
 # and Scene/preset recordings under VOICE/FOLDER01..05. Probe deepest paths first.
 DEFAULT_SOURCES=(
@@ -72,18 +79,54 @@ if [[ "$file_count" -eq 0 ]]; then
     exit 0
 fi
 
-# Tag prompt
+# --- Resume detection ---
+# Unfinished stage = a session dir under $STAGE_BASE that bbsync didn't clean
+# up because stage or push failed. Resuming reuses the SESSION timestamp so we
+# land in the same host dir (mkdir -p is idempotent) and pick up partial files.
+mkdir -p "$STAGE_BASE"
+EXISTING_SESSION=""
+shopt -s nullglob
+for d in "$STAGE_BASE"/session-*; do
+    [[ -d "$d" ]] || continue
+    EXISTING_SESSION="$(basename "$d")"
+    break
+done
+shopt -u nullglob
+
+if [[ -n "$EXISTING_SESSION" ]]; then
+    staged_files_n=$(find "$STAGE_BASE/$EXISTING_SESSION" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) 2>/dev/null | wc -l | tr -d ' ')
+    echo ""
+    echo "Found unfinished stage: $EXISTING_SESSION ($staged_files_n file(s) staged)"
+    read -p "Resume this session? [Y/n] " resume || resume=""
+    if [[ "$resume" =~ ^[Nn]$ ]]; then
+        echo "Discarding $STAGE_BASE/$EXISTING_SESSION and starting fresh."
+        rm -rf "$STAGE_BASE/$EXISTING_SESSION"
+        EXISTING_SESSION=""
+    fi
+fi
+
+if [[ -n "$EXISTING_SESSION" ]]; then
+    SESSION="$EXISTING_SESSION"
+else
+    SESSION="session-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+STAGE_DIR="$STAGE_BASE/$SESSION"
+mkdir -p "$STAGE_DIR"
+SESSION_REL="$HOST_INCOMING_REL/$SESSION"  # relative to remote $HOME
+
+# Tag prompt. On resume, hitting Enter preserves any tags.txt already on host
+# (the atomic-write upload is idempotent — empty TAGS means we don't touch it).
 TAGS=""
 if [[ "$PROMPT" -eq 1 ]]; then
     echo ""
-    echo "Today's context tags (comma-separated, e.g. 'project:foo, person:alice, activity:standup'):"
-    echo "Leave empty to skip tagging."
+    if [[ -n "$EXISTING_SESSION" ]]; then
+        echo "Tags (Enter to keep existing host-side tags.txt, or retype to overwrite):"
+    else
+        echo "Today's context tags (comma-separated, e.g. 'project:foo, person:alice, activity:standup'):"
+        echo "Leave empty to skip tagging."
+    fi
     read -r TAGS || TAGS=""
 fi
-
-# Build session ID
-SESSION="session-$(date -u +%Y%m%dT%H%M%SZ)"
-SESSION_REL="$HOST_INCOMING_REL/$SESSION"  # relative to remote $HOME
 
 if [[ "$DRYRUN" -eq 1 ]]; then
     echo ""
@@ -92,10 +135,29 @@ if [[ "$DRYRUN" -eq 1 ]]; then
     echo "  Files:"
     find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -exec basename {} \; | sed 's/^/    /'
     [[ -n "$TAGS" ]] && echo "  Tags: $TAGS"
+    echo "  Stage:       $STAGE_DIR"
     echo "  Destination: $HOST:~/$SESSION_REL/"
     echo "[DRY RUN end — no files transferred]"
     exit 0
 fi
+
+# --- Stage 1: rsync recorder → local SSD ---
+# rsync with --partial preserves partial files across runs; on a USB drop,
+# rerun bbsync (it auto-resumes via the stage dir) and rsync delta-transfer
+# fills in the gaps. --timeout=120 bails fast if reads stall (so we surface
+# USB death instead of hanging).
+echo ""
+echo "Staging $file_count file(s) to $STAGE_DIR..."
+rsync -av --progress --partial --timeout=120 \
+    --include='*.mp3' --include='*.wav' --include='*.MP3' --include='*.WAV' --exclude='*' \
+    "$SOURCE"/ "$STAGE_DIR/" || {
+    echo "" >&2
+    echo "Stage failed (USB read error?). Partial files retained at $STAGE_DIR." >&2
+    echo "Replug the recorder and rerun 'bbsync' — it will offer to resume." >&2
+    exit 1
+}
+staged_count=$(find "$STAGE_DIR" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) | wc -l | tr -d ' ')
+echo "Staged $staged_count file(s)."
 
 # Atomic session-dir creation + .uploading flag. Combined into ONE ssh call so
 # the bounce processor can never observe a session_dir without the flag (closes
@@ -120,12 +182,15 @@ EOF
     echo "Tags written."
 fi
 
-# Rsync audio files — RELATIVE path so rsync expands to remote user's $HOME
-echo "Uploading $file_count file(s)..."
-rsync -av --progress \
+# --- Stage 2: rsync local stage → host ---
+# Source is now stable local SSD, not flaky USB. RELATIVE path so rsync expands
+# to remote user's $HOME.
+echo "Uploading $staged_count file(s) to $HOST..."
+rsync -av --progress --partial \
     --include='*.mp3' --include='*.wav' --include='*.MP3' --include='*.WAV' --exclude='*' \
-    "$SOURCE"/ "$HOST:$SESSION_REL/" || {
-    echo "Rsync failed. Files remain on the recorder." >&2
+    "$STAGE_DIR"/ "$HOST:$SESSION_REL/" || {
+    echo "Push to $HOST failed. Staged files retained at $STAGE_DIR." >&2
+    echo "Rerun 'bbsync' to resume (network only — recorder not required)." >&2
     echo ".uploading flag retained on $HOST for visibility — clear manually via:" >&2
     echo "  ssh $HOST \"rm -f \\\$HOME/$SESSION_REL/.uploading\"" >&2
     exit 1
@@ -134,8 +199,11 @@ rsync -av --progress \
 # Clear atomicity flag — bounce can now process this session
 ssh "$HOST" "rm -f \"\$HOME/$SESSION_REL/.uploading\""
 
+# Stage delivered to host — local copy no longer needed.
+rm -rf "$STAGE_DIR"
+
 echo ""
-echo "Uploaded $file_count file(s) to $SESSION"
+echo "Uploaded $staged_count file(s) to $SESSION"
 echo ""
 
 # Offer to clean recorder. Tolerate non-tty / EOF stdin (piped invocations):
