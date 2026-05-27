@@ -88,6 +88,16 @@ if [[ ! -d "$BLACKBOX_ROOT" ]]; then
     echo "Creating $BLACKBOX_ROOT (requires sudo)..."
     sudo mkdir -p "$BLACKBOX_ROOT"
     sudo chown "$OPERATOR_USER:$OPERATOR_USER" "$BLACKBOX_ROOT"
+    # `mkdir -p` creates intermediate dirs (e.g. /data) using root's umask.
+    # On hosts with a restrictive root umask (077 — common on Jetson and
+    # hardened images) the parent is born 0700 root:root, so the operator
+    # can't traverse into it to reach their own archive and the `chmod 700`
+    # below fails with "Permission denied". Make the immediate parent
+    # operator-traversable.
+    PARENT_DIR="$(dirname "$BLACKBOX_ROOT")"
+    if [[ "$PARENT_DIR" != "/" ]]; then
+        sudo chmod o+rx "$PARENT_DIR" 2>/dev/null || true
+    fi
 fi
 chmod 700 "$BLACKBOX_ROOT"
 touch "$BLACKBOX_ROOT/_log"
